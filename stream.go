@@ -4,6 +4,9 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"net/http"
+
+	utils "github.com/sashabaranov/go-openai/internal"
 )
 
 var (
@@ -28,8 +31,13 @@ func (c *Client) CreateCompletionStream(
 		return
 	}
 
+	if !checkPromptType(request.Prompt) {
+		err = ErrCompletionRequestPromptTypeNotSupported
+		return
+	}
+
 	request.Stream = true
-	req, err := c.newStreamRequest(ctx, "POST", urlSuffix, request)
+	req, err := c.newStreamRequest(ctx, "POST", urlSuffix, request, request.Model)
 	if err != nil {
 		return
 	}
@@ -38,14 +46,17 @@ func (c *Client) CreateCompletionStream(
 	if err != nil {
 		return
 	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusBadRequest {
+		return nil, c.handleErrorResp(resp)
+	}
 
 	stream = &CompletionStream{
 		streamReader: &streamReader[CompletionResponse]{
 			emptyMessagesLimit: c.config.EmptyMessagesLimit,
 			reader:             bufio.NewReader(resp.Body),
 			response:           resp,
-			errAccumulator:     newErrorAccumulator(),
-			unmarshaler:        &jsonUnmarshaler{},
+			errAccumulator:     utils.NewErrorAccumulator(),
+			unmarshaler:        &utils.JSONUnmarshaler{},
 		},
 	}
 	return

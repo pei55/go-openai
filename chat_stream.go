@@ -3,10 +3,14 @@ package openai
 import (
 	"bufio"
 	"context"
+	"net/http"
+
+	utils "github.com/sashabaranov/go-openai/internal"
 )
 
 type ChatCompletionStreamChoiceDelta struct {
-	Content string `json:"content"`
+	Content string `json:"content,omitempty"`
+	Role    string `json:"role,omitempty"`
 }
 
 type ChatCompletionStreamChoice struct {
@@ -44,7 +48,7 @@ func (c *Client) CreateChatCompletionStream(
 	}
 
 	request.Stream = true
-	req, err := c.newStreamRequest(ctx, "POST", urlSuffix, request)
+	req, err := c.newStreamRequest(ctx, "POST", urlSuffix, request, request.Model)
 	if err != nil {
 		return
 	}
@@ -53,14 +57,17 @@ func (c *Client) CreateChatCompletionStream(
 	if err != nil {
 		return
 	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusBadRequest {
+		return nil, c.handleErrorResp(resp)
+	}
 
 	stream = &ChatCompletionStream{
 		streamReader: &streamReader[ChatCompletionStreamResponse]{
 			emptyMessagesLimit: c.config.EmptyMessagesLimit,
 			reader:             bufio.NewReader(resp.Body),
 			response:           resp,
-			errAccumulator:     newErrorAccumulator(),
-			unmarshaler:        &jsonUnmarshaler{},
+			errAccumulator:     utils.NewErrorAccumulator(),
+			unmarshaler:        &utils.JSONUnmarshaler{},
 		},
 	}
 	return

@@ -1,8 +1,10 @@
-package openai_test
+package openai //nolint:testpackage // testing private field
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -10,13 +12,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"testing"
 
-	. "github.com/sashabaranov/go-openai"
 	"github.com/sashabaranov/go-openai/internal/test"
 	"github.com/sashabaranov/go-openai/internal/test/checks"
-
-	"context"
-	"testing"
 )
 
 // TestAudio Tests the transcription and translation endpoints of the API using the mocked server.
@@ -50,16 +49,26 @@ func TestAudio(t *testing.T) {
 
 	ctx := context.Background()
 
-	dir, cleanup := createTestDirectory(t)
+	dir, cleanup := test.CreateTestDirectory(t)
 	defer cleanup()
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(dir, "fake.mp3")
-			createTestFile(t, path)
+			test.CreateTestFile(t, path)
 
 			req := AudioRequest{
 				FilePath: path,
+				Model:    "whisper-3",
+			}
+			_, err = tc.createFn(ctx, req)
+			checks.NoError(t, err, "audio API error")
+		})
+
+		t.Run(tc.name+" (with reader)", func(t *testing.T) {
+			req := AudioRequest{
+				FilePath: "fake.webm",
+				Reader:   bytes.NewBuffer([]byte(`some webm binary data`)),
 				Model:    "whisper-3",
 			}
 			_, err = tc.createFn(ctx, req)
@@ -98,13 +107,13 @@ func TestAudioWithOptionalArgs(t *testing.T) {
 
 	ctx := context.Background()
 
-	dir, cleanup := createTestDirectory(t)
+	dir, cleanup := test.CreateTestDirectory(t)
 	defer cleanup()
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(dir, "fake.mp3")
-			createTestFile(t, path)
+			test.CreateTestFile(t, path)
 
 			req := AudioRequest{
 				FilePath:    path,
@@ -112,32 +121,12 @@ func TestAudioWithOptionalArgs(t *testing.T) {
 				Prompt:      "用简体中文",
 				Temperature: 0.5,
 				Language:    "zh",
+				Format:      AudioResponseFormatSRT,
 			}
 			_, err = tc.createFn(ctx, req)
 			checks.NoError(t, err, "audio API error")
 		})
 	}
-}
-
-// createTestFile creates a fake file with "hello" as the content.
-func createTestFile(t *testing.T, path string) {
-	file, err := os.Create(path)
-	checks.NoError(t, err, "failed to create file")
-
-	if _, err = file.WriteString("hello"); err != nil {
-		t.Fatalf("failed to write to file %v", err)
-	}
-	file.Close()
-}
-
-// createTestDirectory creates a temporary folder which will be deleted when cleanup is called.
-func createTestDirectory(t *testing.T) (path string, cleanup func()) {
-	t.Helper()
-
-	path, err := os.MkdirTemp(os.TempDir(), "")
-	checks.NoError(t, err)
-
-	return path, func() { os.RemoveAll(path) }
 }
 
 // handleAudioEndpoint Handles the completion endpoint by the test server.
@@ -187,4 +176,100 @@ func handleAudioEndpoint(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to write body", http.StatusInternalServerError)
 		return
 	}
+}
+
+func TestAudioWithFailingFormBuilder(t *testing.T) {
+	dir, cleanup := test.CreateTestDirectory(t)
+	defer cleanup()
+	path := filepath.Join(dir, "fake.mp3")
+	test.CreateTestFile(t, path)
+
+	req := AudioRequest{
+		FilePath:    path,
+		Prompt:      "test",
+		Temperature: 0.5,
+		Language:    "en",
+		Format:      AudioResponseFormatSRT,
+	}
+
+	mockFailedErr := fmt.Errorf("mock form builder fail")
+	mockBuilder := &mockFormBuilder{}
+
+	mockBuilder.mockCreateFormFile = func(string, *os.File) error {
+		return mockFailedErr
+	}
+	err := audioMultipartForm(req, mockBuilder)
+	checks.ErrorIs(t, err, mockFailedErr, "audioMultipartForm should return error if form builder fails")
+
+	mockBuilder.mockCreateFormFile = func(string, *os.File) error {
+		return nil
+	}
+
+	var failForField string
+	mockBuilder.mockWriteField = func(fieldname, value string) error {
+		if fieldname == failForField {
+			return mockFailedErr
+		}
+		return nil
+	}
+
+	failOn := []string{"model", "prompt", "temperature", "language", "response_format"}
+	for _, failingField := range failOn {
+		failForField = failingField
+		mockFailedErr = fmt.Errorf("mock form builder fail on field %s", failingField)
+
+		err = audioMultipartForm(req, mockBuilder)
+		checks.ErrorIs(t, err, mockFailedErr, "audioMultipartForm should return error if form builder fails")
+	}
+}
+
+func TestCreateFileField(t *testing.T) {
+	t.Run("createFileField failing file", func(t *testing.T) {
+		dir, cleanup := test.CreateTestDirectory(t)
+		defer cleanup()
+		path := filepath.Join(dir, "fake.mp3")
+		test.CreateTestFile(t, path)
+
+		req := AudioRequest{
+			FilePath: path,
+		}
+
+		mockFailedErr := fmt.Errorf("mock form builder fail")
+		mockBuilder := &mockFormBuilder{
+			mockCreateFormFile: func(string, *os.File) error {
+				return mockFailedErr
+			},
+		}
+
+		err := createFileField(req, mockBuilder)
+		checks.ErrorIs(t, err, mockFailedErr, "createFileField using a file should return error if form builder fails")
+	})
+
+	t.Run("createFileField failing reader", func(t *testing.T) {
+		req := AudioRequest{
+			FilePath: "test.wav",
+			Reader:   bytes.NewBuffer([]byte(`wav test contents`)),
+		}
+
+		mockFailedErr := fmt.Errorf("mock form builder fail")
+		mockBuilder := &mockFormBuilder{
+			mockCreateFormFileReader: func(string, io.Reader, string) error {
+				return mockFailedErr
+			},
+		}
+
+		err := createFileField(req, mockBuilder)
+		checks.ErrorIs(t, err, mockFailedErr, "createFileField using a reader should return error if form builder fails")
+	})
+
+	t.Run("createFileField failing open", func(t *testing.T) {
+		req := AudioRequest{
+			FilePath: "non_existing_file.wav",
+		}
+
+		mockBuilder := &mockFormBuilder{}
+
+		err := createFileField(req, mockBuilder)
+		checks.HasError(t, err, "createFileField using file should return error when open file fails")
+	})
 }
